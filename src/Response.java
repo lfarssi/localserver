@@ -1,3 +1,4 @@
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
@@ -16,5 +17,23 @@ public class Response {
         r.headers.put("Content-Type",contentType+"; charset=utf-8");
         return r;
     }
-   
+   public List<ByteBuffer> toByteBuffers(){
+    if(!headers.containsKey("Content-Length")){
+        headers.put("Content-Length",String.valueOf(body.length));
+    }
+    if(!headers.containsKey("Connection")){
+        headers.put("Connection",closeAfterWrite?"close":"keep-alive");
+    }
+    if(!headers.containsKey("Server")){
+        headers.put("Server","LocalServer/1.0");
+    }
+    StringBuilder sb=new StringBuilder();
+    sb.append("HTTP/1.1").append(status).append(" ").append(reason).append("\r\n");
+    for(var e:headers.entrySet()){
+        sb.append(e.getKey()).append(": ").append(e.getValue()).append("\r\n");
+    }
+    sb.append("\r\n");
+    byte[] head=sb.toString().getBytes(StandardCharsets.ISO_8859_1);
+    return List.of(ByteBuffer.wrap(head),ByteBuffer.wrap(body));
+   }
 }
