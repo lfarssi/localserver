@@ -1,13 +1,7 @@
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
+import java.nio.file.*;
+import java.util.*;
+
 
 public class ConfigLoader {
     public static final class Config {
@@ -24,13 +18,11 @@ public class ConfigLoader {
         public String root;
         public String index;
         public Set<String> methods = new HashSet<>();
-        public boolean dirListing;
+        public boolean dirLilsting;
 
         public String redirectTo;
         public int redirectCode = 302;
-
         public boolean upload;
-
         public String cgiExt;
     }
 
@@ -38,14 +30,13 @@ public class ConfigLoader {
         String json = Files.readString(path, StandardCharsets.UTF_8);
         Object v = new MiniJson(json).parseValue();
         if (!(v instanceof Map))
-            throw new IllegalArgumentException("Config must be a JSON object");
+            throw new IllegalArgumentException("Config must be a JSON obejct");
 
         @SuppressWarnings("unchecked")
         Map<String, Object> o = (Map<String, Object>) v;
-
         Config cfg = new Config();
         cfg.host = str(o, "host", "0.0.0.0");
-        cfg.errorPagesDir = str(o, "errorPagesDir", "error_pages");
+        cfg.errorPagesDir = str(o, "errorPagesDir", "err");
         cfg.clientBodyLimitBytes = num(o, "clientBodyLimitBytes", 1024 * 1024);
         cfg.defaultServerPort = num(o, "defaultServerPort", 8080);
 
@@ -54,7 +45,6 @@ public class ConfigLoader {
             cfg.ports.add(((Number) p).intValue());
         if (cfg.ports.isEmpty())
             throw new IllegalArgumentException("ports must not be empty");
-
         List<Object> routes = arr(o, "routes");
         for (Object r0 : routes) {
             if (!(r0 instanceof Map))
@@ -66,7 +56,7 @@ public class ConfigLoader {
             rt.pathPrefix = str(r, "pathPrefix", "/");
             rt.root = str(r, "root", "www");
             rt.index = str(r, "index", "index.html");
-            rt.dirListing = bool(r, "dirListing", false);
+            rt.dirLilsting = bool(r, "dirListing", false);
 
             if (r.containsKey("redirectTo")) {
                 rt.redirectTo = str(r, "redirectTo", null);
@@ -80,10 +70,8 @@ public class ConfigLoader {
             List<Object> ms = r.containsKey("methods") ? (List<Object>) r.get("methods") : List.of();
             for (Object m : ms)
                 rt.methods.add(String.valueOf(m).toUpperCase(Locale.ROOT));
-
             cfg.routes.add(rt);
         }
-
         validate(cfg);
         return cfg;
     }
@@ -92,7 +80,7 @@ public class ConfigLoader {
         if (cfg.host == null || cfg.host.isBlank())
             throw new IllegalArgumentException("host missing");
         if (cfg.clientBodyLimitBytes <= 0)
-            throw new IllegalArgumentException("clientBodyLimitBytes must be > 0");
+            throw new IllegalArgumentException("clientBodyLimitBytes must be >0");
         for (Route r : cfg.routes) {
             if (r.pathPrefix == null || !r.pathPrefix.startsWith("/"))
                 throw new IllegalArgumentException("route.pathPrefix must start with /");
