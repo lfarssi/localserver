@@ -19,7 +19,7 @@ public class ErrorPages {
                 r.status = code;
                 r.reason = reason;
                 r.body = Files.readAllBytes(p);
-                r.headers.put("Content-Type", "text/html; charset=utf-8");
+                r.setHeader("Content-Type", "text/html; charset=utf-8");
                 return r;
             }
         } catch (Exception ignored) {}

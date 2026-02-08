@@ -26,6 +26,9 @@ public class ConfigLoader {
         public boolean upload;
 
         public String cgiExt;
+        public String cgiInterpreter;
+        public int cgiTimeoutMs = 3000;
+public int cgiMaxOutputBytes = 2_000_000;
     }
 
     public static Config load(Path path) throws Exception {

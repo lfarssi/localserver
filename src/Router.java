@@ -1,14 +1,35 @@
 import java.nio.file.*;
 import java.util.*;
 
+import utils.CookieUtil;
+import utils.SessionManager;
+
 public class Router {
     private final ConfigLoader.Config cfg;
+    private final SessionManager sessionManager = new SessionManager(30 * 60 * 1000L); // 30 min TTL
 
     public Router(ConfigLoader.Config cfg) {
         this.cfg = cfg;
     }
 
+    // Server will call this periodically
+    public void cleanupSessions(long nowMs) {
+        sessionManager.cleanup(nowMs);
+    }
+
     public Response handle(HttpModels.Request req) {
+
+        long now = System.currentTimeMillis();
+
+        // ---- SESSION: parse cookies ----
+        Map<String, String> cookies = CookieUtil.parseCookieHeader(req.headers.get("cookie"));
+
+        // ---- SESSION: get or create ----
+        SessionManager.Session session = sessionManager.getOrCreate(cookies, now);
+
+        // If client didn't send SID (or it was expired), we must set it
+        boolean needsSetCookie = !session.id.equals(cookies.get(SessionManager.COOKIE_NAME));
+
         // Find best matching route by longest pathPrefix
         ConfigLoader.Route route = null;
         int best = -1;
@@ -19,36 +40,63 @@ public class Router {
             }
         }
 
-        if (route == null)
-            return ErrorPages.response(cfg, 404);
+        Response resp;
 
-        if (!route.methods.isEmpty() && !route.methods.contains(req.method)) {
-            Response r = ErrorPages.response(cfg, 405);
-            r.headers.put("Allow", String.join(", ", route.methods));
-            return r;
+        if (route == null) {
+            resp = ErrorPages.response(cfg, 404);
+            return attachSessionCookie(resp, needsSetCookie, session);
         }
 
-        //upload handler
-        if(route.upload){
-            if(!"POST".equals(req.method)) return ErrorPages.response(cfg, 405);
-            return UploadHandler.handle(cfg, route, req);
+        if (!route.methods.isEmpty() && !route.methods.contains(req.method)) {
+            resp = ErrorPages.response(cfg, 405);
+            resp.setHeader("Allow", String.join(", ", route.methods));
+            return attachSessionCookie(resp, needsSetCookie, session);
+        }
+
+        // upload handler
+        if (route.upload) {
+            if (!"POST".equals(req.method)) {
+                resp = ErrorPages.response(cfg, 405);
+                return attachSessionCookie(resp, needsSetCookie, session);
+            }
+            resp = UploadHandler.handle(cfg, route, req);
+            return attachSessionCookie(resp, needsSetCookie, session);
         }
 
         // Redirect
         if (route.redirectTo != null) {
-            Response r = Response.text(route.redirectCode, "Moved", "text/plain", "");
-            r.headers.put("Location", route.redirectTo);
-            return r;
+            resp = Response.text(route.redirectCode, "Moved", "text/plain", "");
+            resp.setHeader("Location", route.redirectTo);
+            return attachSessionCookie(resp, needsSetCookie, session);
         }
 
-        // CGI (placeholder for later wiring)
+        // CGI
         if (route.cgiExt != null && req.path.endsWith(route.cgiExt)) {
-            return Response.text(501, "Not Implemented", "text/plain",
-                    "CGI route matched but CGI handler not wired yet.\n");
+            // If you haven't added CGIHandler yet, keep your 501, but sessions still apply
+            // resp = Response.text(501, "Not Implemented", "text/plain",
+            // "CGI route matched but CGI handler not wired yet.\n");
+
+            resp = CGIHandler.handle(cfg, route, req); // <-- requires the CGIHandler class I gave you
+            return attachSessionCookie(resp, needsSetCookie, session);
         }
 
         // Static file serving
-        return serveStatic(route, req);
+        resp = serveStatic(route, req);
+        return attachSessionCookie(resp, needsSetCookie, session);
+    }
+
+    private Response attachSessionCookie(Response resp, boolean needsSetCookie, SessionManager.Session session) {
+        if (needsSetCookie) {
+            resp.addHeader("Set-Cookie", CookieUtil.buildSetCookie(
+                    SessionManager.COOKIE_NAME,
+                    session.id,
+                    "/",
+                    true,
+                    false,
+                    "Lax",
+                    null));
+        }
+        return resp;
     }
 
     private Response serveStatic(ConfigLoader.Route route, HttpModels.Request req) {
@@ -58,6 +106,8 @@ public class Router {
             String rel = req.path.substring(route.pathPrefix.length());
             if (rel.isEmpty())
                 rel = "/";
+
+            // If rel is "/" then substring(1) is "", root.resolve("") == root
             Path resolved = root.resolve(rel.substring(1)).normalize();
 
             // prevent traversal
@@ -100,7 +150,7 @@ public class Router {
         r.status = 200;
         r.reason = "OK";
         r.body = Files.readAllBytes(p);
-        r.headers.put("Content-Type", guessContentType(p));
+        r.setHeader("Content-Type", guessContentType(p));
         return r;
     }
 

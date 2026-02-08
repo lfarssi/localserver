@@ -22,7 +22,9 @@
       "pathPrefix": "/cgi",
       "root": "cgi-bin",
       "methods": ["GET", "POST"],
-      "cgiExt": ".py"
+      "cgiExt": ".py",
+      "cgiInterpreter": "python3",
+      "cgiTimeoutMs":3000
     },
     {
       "pathPrefix": "/old",
