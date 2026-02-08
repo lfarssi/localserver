@@ -4,80 +4,86 @@ import java.util.*;
 
 public class HttpParser {
 
-    enum Status {
-        OK, NEED_MORE, ERROR
-    }
-
-    enum Stage {
-        START, HEADERS, BODY, CHUNKED
-    }
-
-    Stage stage = Stage.START;
-    long stageStartMs = System.currentTimeMillis();
-
-    private HttpModels.Request current;
-    private int contentLength = 0;
-
-    // for chunked
-    private int chunkRemaining = -1;
-    private final ByteArrayOutput bodyAcc = new ByteArrayOutput(1024 * 16);
+    public enum Status { OK, NEED_MORE, ERROR }
+    public enum Stage { START, HEADERS, BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_TRAILERS }
 
     public static final class ParseResult {
         public final Status status;
         public final HttpModels.Request request;
+        public final int errorCode; // 0 if not error; else 400/413
 
-        ParseResult(Status status, HttpModels.Request request) {
+        private ParseResult(Status status, HttpModels.Request request, int errorCode) {
             this.status = status;
             this.request = request;
+            this.errorCode = errorCode;
         }
 
-        static ParseResult needMore() {
-            return new ParseResult(Status.NEED_MORE, null);
-        }
-
-        static ParseResult error() {
-            return new ParseResult(Status.ERROR, null);
-        }
-
-        static ParseResult ok(HttpModels.Request r) {
-            return new ParseResult(Status.OK, r);
-        }
+        public static ParseResult needMore() { return new ParseResult(Status.NEED_MORE, null, 0); }
+        public static ParseResult ok(HttpModels.Request r) { return new ParseResult(Status.OK, r, 0); }
+        public static ParseResult error(int code) { return new ParseResult(Status.ERROR, null, code); }
     }
+
+    public Stage stage = Stage.START;
+    public long stageStartMs = System.currentTimeMillis();
+
+    private HttpModels.Request current;
+    private int contentLength = 0;
+
+    // chunked state
+    private int chunkRemaining = 0;
+    private boolean chunked = false;
+
+    // body accumulation (yes, still buffers; streaming comes later)
+    private final ByteArrayOutput bodyAcc = new ByteArrayOutput(16 * 1024);
+    private int bodyLimit = 0;
 
     public ParseResult parse(ByteBuffer in, int bodyLimitBytes) {
         try {
+            this.bodyLimit = bodyLimitBytes;
+
             if (stage == Stage.START) {
                 current = new HttpModels.Request();
+                contentLength = 0;
+                chunkRemaining = 0;
+                chunked = false;
+                bodyAcc.reset();
                 stage = Stage.HEADERS;
                 stageStartMs = System.currentTimeMillis();
-                contentLength = 0;
-                chunkRemaining = -1;
-                bodyAcc.reset();
             }
 
+            // -------- HEADERS --------
             if (stage == Stage.HEADERS) {
                 String headersBlock = readUntilDoubleCRLF(in);
-                if (headersBlock == null)
-                    return ParseResult.needMore();
+                if (headersBlock == null) return ParseResult.needMore();
 
-                if (!parseStartLineAndHeaders(headersBlock, current))
-                    return ParseResult.error();
+                if (!parseStartLineAndHeaders(headersBlock, current)) {
+                    resetToStart();
+                    return ParseResult.error(400);
+                }
 
-                // Determine body mode
+                // Decide body mode
                 String te = current.headers.getOrDefault("transfer-encoding", "");
-                if (te.toLowerCase(Locale.ROOT).contains("chunked")) {
-                    stage = Stage.CHUNKED;
+                if (containsChunked(te)) {
+                    chunked = true;
+                    stage = Stage.CHUNK_SIZE;
                     stageStartMs = System.currentTimeMillis();
+                    // HTTP/1.1: ignore Content-Length if chunked present
+                    contentLength = 0;
                 } else {
+                    chunked = false;
                     String cl = current.headers.get("content-length");
                     contentLength = (cl == null) ? 0 : parseIntSafe(cl, -1);
-                    if (contentLength < 0)
-                        return ParseResult.error();
-                    if (contentLength > bodyLimitBytes)
-                        return ParseResult.error(); // map to 413 later if you prefer
+                    if (contentLength < 0) {
+                        resetToStart();
+                        return ParseResult.error(400);
+                    }
+                    if (contentLength > bodyLimit) {
+                        resetToStart();
+                        return ParseResult.error(413);
+                    }
                     if (contentLength == 0) {
                         HttpModels.Request done = current;
-                        stage = Stage.START;
+                        resetToStart();
                         return ParseResult.ok(done);
                     }
                     stage = Stage.BODY;
@@ -85,88 +91,152 @@ public class HttpParser {
                 }
             }
 
+            // -------- FIXED BODY (Content-Length) --------
             if (stage == Stage.BODY) {
-                if (in.remaining() < contentLength)
-                    return ParseResult.needMore();
+                if (in.remaining() < contentLength) return ParseResult.needMore();
                 byte[] body = new byte[contentLength];
                 in.get(body);
                 current.body = body;
 
                 HttpModels.Request done = current;
-                stage = Stage.START;
+                resetToStart();
                 return ParseResult.ok(done);
             }
 
-            if (stage == Stage.CHUNKED) {
-                // chunked format: <hex>\r\n<data>\r\n ... 0\r\n\r\n
-                while (true) {
-                    if (chunkRemaining < 0) {
-                        String line = readLineCRLF(in);
-                        if (line == null)
-                            return ParseResult.needMore();
-                        int semi = line.indexOf(';');
-                        String hex = (semi >= 0) ? line.substring(0, semi) : line;
-                        chunkRemaining = Integer.parseInt(hex.trim(), 16);
-                        if (chunkRemaining == 0) {
-                            // read trailing CRLF line after 0 chunk and optional trailers (minimal: require
-                            // \r\n)
-                            String end = readUntilDoubleCRLF(in);
-                            if (end == null)
-                                return ParseResult.needMore();
-                            current.body = bodyAcc.toByteArray();
-                            HttpModels.Request done = current;
-                            stage = Stage.START;
-                            return ParseResult.ok(done);
-                        }
+            // -------- CHUNKED --------
+            while (chunked) {
+
+                if (stage == Stage.CHUNK_SIZE) {
+                    String line = readLineCRLF(in);
+                    if (line == null) return ParseResult.needMore();
+
+                    // chunk-size can include extensions: "4;ext=1"
+                    int semi = line.indexOf(';');
+                    String hex = (semi >= 0) ? line.substring(0, semi) : line;
+                    hex = hex.trim();
+
+                    if (hex.isEmpty()) {
+                        resetToStart();
+                        return ParseResult.error(400);
                     }
 
-                    if (in.remaining() < chunkRemaining + 2)
-                        return ParseResult.needMore(); // +CRLF
+                    int size;
+                    try {
+                        size = Integer.parseInt(hex, 16);
+                    } catch (Exception e) {
+                        resetToStart();
+                        return ParseResult.error(400);
+                    }
+
+                    chunkRemaining = size;
+
+                    if (chunkRemaining == 0) {
+                        // Next: trailers terminated by blank line
+                        stage = Stage.CHUNK_TRAILERS;
+                        stageStartMs = System.currentTimeMillis();
+                        continue;
+                    } else {
+                        stage = Stage.CHUNK_DATA;
+                        stageStartMs = System.currentTimeMillis();
+                        continue;
+                    }
+                }
+
+                if (stage == Stage.CHUNK_DATA) {
+                    // Need chunkRemaining bytes + CRLF after data
+                    if (in.remaining() < chunkRemaining + 2) return ParseResult.needMore();
+
+                    // Enforce body limit while accumulating
+                    if (bodyAcc.size() + chunkRemaining > bodyLimit) {
+                        resetToStart();
+                        return ParseResult.error(413);
+                    }
+
                     byte[] data = new byte[chunkRemaining];
                     in.get(data);
                     bodyAcc.write(data);
 
-                    // consume CRLF
                     byte c1 = in.get();
                     byte c2 = in.get();
-                    if (c1 != '\r' || c2 != '\n')
-                        return ParseResult.error();
+                    if (c1 != '\r' || c2 != '\n') {
+                        resetToStart();
+                        return ParseResult.error(400);
+                    }
 
-                    chunkRemaining = -1;
+                    // Next chunk size line
+                    stage = Stage.CHUNK_SIZE;
+                    stageStartMs = System.currentTimeMillis();
+                    continue;
                 }
+
+                if (stage == Stage.CHUNK_TRAILERS) {
+                    // Trailer section: 0 or more header lines, terminated by empty line (CRLF)
+                    // We ignore contents but must consume correctly.
+                    String line = readLineCRLF(in);
+                    if (line == null) return ParseResult.needMore();
+
+                    if (line.isEmpty()) {
+                        // Done: finalize request
+                        current.body = bodyAcc.toByteArray();
+                        HttpModels.Request done = current;
+                        resetToStart();
+                        return ParseResult.ok(done);
+                    }
+
+                    // Non-empty trailer line -> ignore and continue
+                    continue;
+                }
+
+                // Should never hit here
+                break;
             }
 
             return ParseResult.needMore();
+
         } catch (Exception e) {
-            return ParseResult.error();
+            resetToStart();
+            return ParseResult.error(400);
         }
+    }
+
+    private void resetToStart() {
+        stage = Stage.START;
+        stageStartMs = System.currentTimeMillis();
+        current = null;
+        contentLength = 0;
+        chunkRemaining = 0;
+        chunked = false;
+        bodyAcc.reset();
+    }
+
+    private static boolean containsChunked(String te) {
+        if (te == null) return false;
+        String x = te.toLowerCase(Locale.ROOT);
+        // handle "gzip, chunked" etc
+        for (String part : x.split(",")) {
+            if (part.trim().equals("chunked")) return true;
+        }
+        return false;
     }
 
     private static boolean parseStartLineAndHeaders(String block, HttpModels.Request req) {
         String[] lines = block.split("\r\n");
-        if (lines.length < 1)
-            return false;
+        if (lines.length < 1) return false;
 
         String[] parts = lines[0].split(" ");
-        if (parts.length != 3)
-            return false;
+        if (parts.length != 3) return false;
 
         req.method = parts[0].trim();
         req.target = parts[1].trim();
         req.version = parts[2].trim();
 
-        // Basic HTTP/1.1 requirement
-        if (!req.version.equals("HTTP/1.1"))
-            return false;
+        if (!"HTTP/1.1".equals(req.version)) return false;
 
-        // headers
         for (int i = 1; i < lines.length; i++) {
             String line = lines[i];
-            if (line.isEmpty())
-                continue;
+            if (line.isEmpty()) continue;
             int idx = line.indexOf(':');
-            if (idx <= 0)
-                return false;
+            if (idx <= 0) return false;
             String k = line.substring(0, idx).trim().toLowerCase(Locale.ROOT);
             String v = line.substring(idx + 1).trim();
             req.headers.put(k, v);
@@ -183,15 +253,10 @@ public class HttpParser {
     }
 
     private static int parseIntSafe(String s, int def) {
-        try {
-            return Integer.parseInt(s.trim());
-        } catch (Exception e) {
-            return def;
-        }
+        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
     }
 
-    // Reads until \r\n\r\n. Returns the text excluding final delimiter. Null if
-    // incomplete.
+    // Reads until \r\n\r\n. Returns text excluding delimiter. Null if incomplete.
     private static String readUntilDoubleCRLF(ByteBuffer in) {
         int startPos = in.position();
         for (int i = startPos; i + 3 < in.limit(); i++) {
@@ -199,15 +264,14 @@ public class HttpParser {
                 int len = i - startPos;
                 byte[] bytes = new byte[len];
                 in.get(bytes);
-                in.position(in.position() + 4); // skip \r\n\r\n
+                in.position(in.position() + 4);
                 return new String(bytes, StandardCharsets.ISO_8859_1);
             }
         }
         return null;
     }
 
-    // Reads one line ending with CRLF, returns string without CRLF. Null if
-    // incomplete.
+    // Reads one line ending with CRLF. Returns line without CRLF. Null if incomplete.
     private static String readLineCRLF(ByteBuffer in) {
         int startPos = in.position();
         for (int i = startPos; i + 1 < in.limit(); i++) {
@@ -215,25 +279,23 @@ public class HttpParser {
                 int len = i - startPos;
                 byte[] bytes = new byte[len];
                 in.get(bytes);
-                in.position(in.position() + 2); // skip CRLF
+                in.position(in.position() + 2);
                 return new String(bytes, StandardCharsets.ISO_8859_1);
             }
         }
         return null;
     }
 
-    // Small helper to avoid repeated allocations
+    // small accumulator
     static final class ByteArrayOutput {
         private byte[] buf;
         private int size;
 
-        ByteArrayOutput(int cap) {
-            buf = new byte[cap];
-        }
+        ByteArrayOutput(int cap) { buf = new byte[cap]; }
 
-        void reset() {
-            size = 0;
-        }
+        void reset() { size = 0; }
+
+        int size() { return size; }
 
         void write(byte[] b) {
             ensure(size + b.length);
@@ -242,16 +304,12 @@ public class HttpParser {
         }
 
         void ensure(int cap) {
-            if (cap <= buf.length)
-                return;
+            if (cap <= buf.length) return;
             int n = buf.length;
-            while (n < cap)
-                n *= 2;
+            while (n < cap) n *= 2;
             buf = Arrays.copyOf(buf, n);
         }
 
-        byte[] toByteArray() {
-            return Arrays.copyOf(buf, size);
-        }
+        byte[] toByteArray() { return Arrays.copyOf(buf, size); }
     }
 }

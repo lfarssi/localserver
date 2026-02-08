@@ -37,23 +37,40 @@ public class Server {
         while (true) {
             try {
                 selector.select(250); // short tick to handle timeouts
+
                 Iterator<SelectionKey> it = selector.selectedKeys().iterator();
                 while (it.hasNext()) {
                     SelectionKey key = it.next();
                     it.remove();
 
-                    if (!key.isValid())
-                        continue;
+                    try {
+                        if (!key.isValid())
+                            continue;
 
-                    if (key.isAcceptable())
-                        onAccept(key);
-                    if (key.isReadable())
-                        onRead(key);
-                    if (key.isWritable())
-                        onWrite(key);
+                        int ops = key.readyOps(); // snapshot ops; safe against mid-loop cancellation
+
+                        if ((ops & SelectionKey.OP_ACCEPT) != 0)
+                            onAccept(key);
+                        if ((ops & SelectionKey.OP_READ) != 0)
+                            onRead(key);
+                        if ((ops & SelectionKey.OP_WRITE) != 0)
+                            onWrite(key);
+
+                    } catch (CancelledKeyException ignored) {
+                        // key cancelled while processing; ignore safely
+                    } catch (Exception e) {
+                        // per-key safety: don't poison the whole loop
+                        System.err.println("Key error: " + e.getMessage());
+                        e.printStackTrace();
+                        try {
+                            key.channel().close();
+                        } catch (Exception ignored2) {
+                        }
+                    }
                 }
 
                 enforceTimeouts();
+
             } catch (Exception e) {
                 // Catch-all: must never crash
                 System.err.println("Loop error: " + e.getMessage());
@@ -105,9 +122,11 @@ public class Server {
                     break;
 
                 if (pr.status == HttpParser.Status.ERROR) {
-                    Response resp = ErrorPages.response(cfg, 400);
+                    int code = (pr.errorCode == 413) ? 413 : 400;
+                    Response resp = ErrorPages.response(cfg, code);
                     ctx.enqueue(resp.toByteBuffers());
-                    key.interestOps(SelectionKey.OP_WRITE);
+                    if (key.isValid())
+                        key.interestOps(SelectionKey.OP_WRITE);
                     ctx.closeAfterWrite = true;
                     break;
                 }
@@ -130,7 +149,9 @@ public class Server {
                 if (close || resp.closeAfterWrite)
                     ctx.closeAfterWrite = true;
 
-                key.interestOps(SelectionKey.OP_WRITE);
+                if (key.isValid())
+                    key.interestOps(SelectionKey.OP_WRITE);
+
                 if (ctx.readBuffer.remaining() == 0)
                     break;
             }
@@ -166,7 +187,8 @@ public class Server {
                     closeConnection(ch);
                     return;
                 }
-                key.interestOps(SelectionKey.OP_READ);
+                if (key.isValid())
+                    key.interestOps(SelectionKey.OP_READ);
             }
         } catch (IOException e) {
             closeConnection(ch);
@@ -194,7 +216,7 @@ public class Server {
                     if (stageAge > HEADER_TIMEOUT_MS)
                         toClose.add(ch);
                 }
-                case BODY, CHUNKED -> {
+                case BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_TRAILERS -> {
                     if (stageAge > BODY_TIMEOUT_MS)
                         toClose.add(ch);
                 }
@@ -205,6 +227,9 @@ public class Server {
 
         for (SocketChannel ch : toClose)
             closeConnection(ch);
+
+        // Session cleanup tick
+        router.cleanupSessions(now);
     }
 
     private void closeConnection(SocketChannel ch) {
