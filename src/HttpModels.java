@@ -10,5 +10,7 @@ public class HttpModels {
 
         public Map<String, String> headers = new HashMap<>();
         public byte[] body = new byte[0];
+        public Map<String, Object> attrs = new HashMap<>();
+
     }
 }
