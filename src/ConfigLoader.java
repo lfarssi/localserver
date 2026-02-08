@@ -1,9 +1,9 @@
-import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-
 public class ConfigLoader {
+
     public static final class Config {
         public String host;
         public List<Integer> ports = new ArrayList<>();
@@ -18,11 +18,13 @@ public class ConfigLoader {
         public String root;
         public String index;
         public Set<String> methods = new HashSet<>();
-        public boolean dirLilsting;
+        public boolean dirListing;
 
         public String redirectTo;
         public int redirectCode = 302;
+
         public boolean upload;
+
         public String cgiExt;
     }
 
@@ -30,13 +32,14 @@ public class ConfigLoader {
         String json = Files.readString(path, StandardCharsets.UTF_8);
         Object v = new MiniJson(json).parseValue();
         if (!(v instanceof Map))
-            throw new IllegalArgumentException("Config must be a JSON obejct");
+            throw new IllegalArgumentException("Config must be a JSON object");
 
         @SuppressWarnings("unchecked")
         Map<String, Object> o = (Map<String, Object>) v;
+
         Config cfg = new Config();
         cfg.host = str(o, "host", "0.0.0.0");
-        cfg.errorPagesDir = str(o, "errorPagesDir", "err");
+        cfg.errorPagesDir = str(o, "errorPagesDir", "error_pages");
         cfg.clientBodyLimitBytes = num(o, "clientBodyLimitBytes", 1024 * 1024);
         cfg.defaultServerPort = num(o, "defaultServerPort", 8080);
 
@@ -45,6 +48,7 @@ public class ConfigLoader {
             cfg.ports.add(((Number) p).intValue());
         if (cfg.ports.isEmpty())
             throw new IllegalArgumentException("ports must not be empty");
+
         List<Object> routes = arr(o, "routes");
         for (Object r0 : routes) {
             if (!(r0 instanceof Map))
@@ -56,7 +60,7 @@ public class ConfigLoader {
             rt.pathPrefix = str(r, "pathPrefix", "/");
             rt.root = str(r, "root", "www");
             rt.index = str(r, "index", "index.html");
-            rt.dirLilsting = bool(r, "dirListing", false);
+            rt.dirListing = bool(r, "dirListing", false);
 
             if (r.containsKey("redirectTo")) {
                 rt.redirectTo = str(r, "redirectTo", null);
@@ -70,8 +74,10 @@ public class ConfigLoader {
             List<Object> ms = r.containsKey("methods") ? (List<Object>) r.get("methods") : List.of();
             for (Object m : ms)
                 rt.methods.add(String.valueOf(m).toUpperCase(Locale.ROOT));
+
             cfg.routes.add(rt);
         }
+
         validate(cfg);
         return cfg;
     }
@@ -80,7 +86,7 @@ public class ConfigLoader {
         if (cfg.host == null || cfg.host.isBlank())
             throw new IllegalArgumentException("host missing");
         if (cfg.clientBodyLimitBytes <= 0)
-            throw new IllegalArgumentException("clientBodyLimitBytes must be >0");
+            throw new IllegalArgumentException("clientBodyLimitBytes must be > 0");
         for (Route r : cfg.routes) {
             if (r.pathPrefix == null || !r.pathPrefix.startsWith("/"))
                 throw new IllegalArgumentException("route.pathPrefix must start with /");
@@ -108,6 +114,7 @@ public class ConfigLoader {
         return (v instanceof List) ? (List<Object>) v : List.of();
     }
 
+    // Tiny JSON parser: objects, arrays, strings, numbers, booleans, null.
     static final class MiniJson {
         private final String s;
         private int i = 0;
@@ -129,11 +136,11 @@ public class ConfigLoader {
             if (c == '"')
                 return parseString();
             if (c == 't' || c == 'f')
-                return parsBoolean();
+                return parseBoolean();
             if (c == 'n')
                 return parseNull();
             if (c == '-' || Character.isDigit(c))
-                return parsNumber();
+                return parseNumber();
             throw err("Unexpected char: " + c);
         }
 
@@ -201,14 +208,13 @@ public class ConfigLoader {
                         case 't' -> '\t';
                         default -> throw err("Bad escape: \\" + e);
                     });
-                } else {
+                } else
                     sb.append(c);
-                }
             }
             return sb.toString();
         }
 
-        Boolean parsBoolean() {
+        Boolean parseBoolean() {
             if (s.startsWith("true", i)) {
                 i += 4;
                 return true;
@@ -228,7 +234,7 @@ public class ConfigLoader {
             throw err("Bad null");
         }
 
-        Number parsNumber() {
+        Number parseNumber() {
             int start = i;
             if (s.charAt(i) == '-')
                 i++;
@@ -244,7 +250,7 @@ public class ConfigLoader {
         }
 
         void skipWs() {
-            while (i < s.length() && Character.isWhitespace((s.charAt(i))))
+            while (i < s.length() && Character.isWhitespace(s.charAt(i)))
                 i++;
         }
 
@@ -254,8 +260,8 @@ public class ConfigLoader {
 
         void expect(char c) {
             skipWs();
-            if (i > s.length() || s.charAt(i) != c)
-                throw err("Expect '" + c + "'");
+            if (i >= s.length() || s.charAt(i) != c)
+                throw err("Expected '" + c + "'");
             i++;
         }
 

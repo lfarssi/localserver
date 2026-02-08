@@ -1,6 +1,5 @@
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Locale;
+import java.nio.file.*;
+import java.util.*;
 
 public class Router {
     private final ConfigLoader.Config cfg;
@@ -10,6 +9,7 @@ public class Router {
     }
 
     public Response handle(HttpModels.Request req) {
+        // Find best matching route by longest pathPrefix
         ConfigLoader.Route route = null;
         int best = -1;
         for (ConfigLoader.Route r : cfg.routes) {
@@ -17,32 +17,44 @@ public class Router {
                 route = r;
                 best = r.pathPrefix.length();
             }
-
         }
+
         if (route == null)
             return ErrorPages.response(cfg, 404);
+
         if (!route.methods.isEmpty() && !route.methods.contains(req.method)) {
             Response r = ErrorPages.response(cfg, 405);
             r.headers.put("Allow", String.join(", ", route.methods));
             return r;
         }
-        // :redirect
+
+        //upload handler
+        if(route.upload){
+            if(!"POST".equals(req.method)) return ErrorPages.response(cfg, 405);
+            return UploadHandler.handle(cfg, route, req);
+        }
+
+        // Redirect
         if (route.redirectTo != null) {
             Response r = Response.text(route.redirectCode, "Moved", "text/plain", "");
             r.headers.put("Location", route.redirectTo);
             return r;
         }
+
+        // CGI (placeholder for later wiring)
         if (route.cgiExt != null && req.path.endsWith(route.cgiExt)) {
             return Response.text(501, "Not Implemented", "text/plain",
                     "CGI route matched but CGI handler not wired yet.\n");
         }
-        // serve static file
-        return serverStatic(route, req);
+
+        // Static file serving
+        return serveStatic(route, req);
     }
 
-    private Response serverStatic(ConfigLoader.Route route, HttpModels.Request req) {
+    private Response serveStatic(ConfigLoader.Route route, HttpModels.Request req) {
         try {
             Path root = Path.of(route.root).toAbsolutePath().normalize();
+
             String rel = req.path.substring(route.pathPrefix.length());
             if (rel.isEmpty())
                 rel = "/";
@@ -55,15 +67,18 @@ public class Router {
             if (Files.isDirectory(resolved)) {
                 Path idx = resolved.resolve(route.index != null ? route.index : "index.html");
                 if (Files.exists(idx)) {
-                    return filResponse(idx);
+                    return fileResponse(idx);
                 }
-                if (route.dirLilsting) {
+                if (route.dirListing) {
                     return Response.text(200, "OK", "text/plain", "Directory listing not implemented yet.\n");
                 }
                 return ErrorPages.response(cfg, 403);
             }
+
             if (!Files.exists(resolved))
                 return ErrorPages.response(cfg, 404);
+
+            // DELETE support (file delete)
             if ("DELETE".equals(req.method)) {
                 try {
                     Files.delete(resolved);
@@ -72,13 +87,15 @@ public class Router {
                     return ErrorPages.response(cfg, 403);
                 }
             }
-            return filResponse(resolved);
+
+            return fileResponse(resolved);
+
         } catch (Exception e) {
             return ErrorPages.response(cfg, 500);
         }
     }
 
-    private Response filResponse(Path p) throws Exception {
+    private Response fileResponse(Path p) throws Exception {
         Response r = new Response();
         r.status = 200;
         r.reason = "OK";

@@ -5,11 +5,14 @@ public class Main {
         try {
             String configPath = (args.length > 0) ? args[0] : "config.json";
             ConfigLoader.Config cfg = ConfigLoader.load(Path.of(configPath));
-            
-            
-        } catch (Exception ex) {
-            System.err.println("Startup failed: " + ex.getMessage());
-            ex.printStackTrace();
+
+            Router router = new Router(cfg);
+            Server server = new Server(cfg, router);
+            server.run(); // blocks, single-thread loop
+        } catch (Exception e) {
+            // fail-fast at startup with clear message (but never crash at runtime loop)
+            System.err.println("Startup failed: " + e.getMessage());
+            e.printStackTrace();
             System.exit(1);
         }
     }
