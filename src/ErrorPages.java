@@ -7,6 +7,7 @@ public class ErrorPages {
             case 403 -> "Forbidden";
             case 404 -> "Not Found";
             case 405 -> "Method Not Allowed";
+            case 411 -> "Length Required";
             case 413 -> "Payload Too Large";
             default -> "Internal Server Error";
         };

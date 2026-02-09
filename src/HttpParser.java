@@ -10,7 +10,7 @@ public class HttpParser {
     public static final class ParseResult {
         public final Status status;
         public final HttpModels.Request request;
-        public final int errorCode; // 0 if not error; else 400/413
+        public final int errorCode; // 0 if not error; else 400/411/413
 
         private ParseResult(Status status, HttpModels.Request request, int errorCode) {
             this.status = status;
@@ -72,6 +72,13 @@ public class HttpParser {
                 } else {
                     chunked = false;
                     String cl = current.headers.get("content-length");
+
+                    // If no body delimiter for POST/PUT, require length (411)
+                    if (cl == null && isLengthRequired(current.method)) {
+                        resetToStart();
+                        return ParseResult.error(411);
+                    }
+
                     contentLength = (cl == null) ? 0 : parseIntSafe(cl, -1);
                     if (contentLength < 0) {
                         resetToStart();
@@ -217,6 +224,11 @@ public class HttpParser {
             if (part.trim().equals("chunked")) return true;
         }
         return false;
+    }
+
+    private static boolean isLengthRequired(String method) {
+        if (method == null) return false;
+        return "POST".equals(method) || "PUT".equals(method);
     }
 
     private static boolean parseStartLineAndHeaders(String block, HttpModels.Request req) {

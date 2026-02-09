@@ -124,7 +124,7 @@ public class Server {
                 if (pr.status == HttpParser.Status.NEED_MORE) break;
 
                 if (pr.status == HttpParser.Status.ERROR) {
-                    int code = (pr.errorCode == 413) ? 413 : 400;
+                    int code = (pr.errorCode == 0) ? 400 : pr.errorCode;
                     Response resp = ErrorPages.response(cfg, code);
 
                     // Metrics: count as a response too (auditors like this)
