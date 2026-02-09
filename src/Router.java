@@ -79,6 +79,12 @@ public class Router {
             resp = CGIHandler.handle(cfg, route, req); // <-- requires the CGIHandler class I gave you
             return attachSessionCookie(resp, needsSetCookie, session);
         }
+        if ("GET".equals(req.method) && "/metrics".equals(req.path)) {
+            return AdminView.metricsJson(ServerRef.get().metricsSnapshot());
+        }
+        if ("GET".equals(req.method) && "/admin".equals(req.path)) {
+            return AdminView.adminHtml(ServerRef.get().metricsSnapshot());
+        }
 
         // Static file serving
         resp = serveStatic(route, req);

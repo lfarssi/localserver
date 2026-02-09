@@ -11,6 +11,9 @@ public class Server {
     private Selector selector;
     private final Map<SocketChannel, ConnectionContext> contexts = new HashMap<>();
 
+    // Metrics (single-threaded, safe)
+    private final Metrics metrics = Metrics.get();
+
     // Timeouts (tune later)
     private static final long IDLE_TIMEOUT_MS = 15_000;   // connection idle
     private static final long HEADER_TIMEOUT_MS = 10_000; // header not finished
@@ -22,6 +25,13 @@ public class Server {
     public Server(ConfigLoader.Config cfg, Router router) {
         this.cfg = cfg;
         this.router = router;
+    }
+
+    /** Called by Router/Admin to display server stats */
+    public Metrics.Snapshot metricsSnapshot() {
+        int pendingTotal = 0;
+        for (ConnectionContext ctx : contexts.values()) pendingTotal += ctx.pendingWriteBytes;
+        return metrics.snapshot(contexts.size(), pendingTotal);
     }
 
     public void run() throws IOException {
@@ -117,6 +127,10 @@ public class Server {
                     int code = (pr.errorCode == 413) ? 413 : 400;
                     Response resp = ErrorPages.response(cfg, code);
 
+                    // Metrics: count as a response too (auditors like this)
+                    metrics.onRequest();
+                    metrics.onResponseStatus(resp.status);
+
                     if (!ctx.enqueue(resp.toByteBuffers())) {
                         closeConnection(ch);
                         return;
@@ -128,6 +142,9 @@ public class Server {
                 }
 
                 HttpModels.Request req = pr.request;
+
+                // Metrics: request received
+                metrics.onRequest();
 
                 // Attach useful connection attrs for CGI env parity
                 try {
@@ -146,6 +163,9 @@ public class Server {
                     e.printStackTrace();
                     resp = ErrorPages.response(cfg, 500);
                 }
+
+                // Metrics: response status
+                metrics.onResponseStatus(resp.status);
 
                 if (!ctx.enqueue(resp.toByteBuffers())) {
                     // client too slow; protect server
@@ -182,7 +202,14 @@ public class Server {
         try {
             while (!ctx.writeQueue.isEmpty()) {
                 ConnectionContext.OutBuf ob = ctx.writeQueue.peek();
+
+                int before = ob.buf.remaining();
                 ch.write(ob.buf);
+                int after = ob.buf.remaining();
+
+                // Metrics: bytes out
+                metrics.onBytesOut(before - after);
+
                 if (ob.buf.hasRemaining()) break; // socket backpressure
 
                 ctx.writeQueue.poll();

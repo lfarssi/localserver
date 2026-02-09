@@ -8,6 +8,8 @@ public class Main {
 
             Router router = new Router(cfg);
             Server server = new Server(cfg, router);
+            ServerRef.init(server);
+
             server.run(); // blocks, single-thread loop
         } catch (Exception e) {
             // fail-fast at startup with clear message (but never crash at runtime loop)
