@@ -11,6 +11,11 @@ public class UploadHandler {
         try {
             if (req.body == null) req.body = new byte[0];
 
+            // Reject empty uploads explicitly
+            if (req.body.length == 0) {
+                return ErrorPages.response(cfg, 400);
+            }
+
             // Enforce body limit (parser already does; but double-check here too)
             if (req.body.length > cfg.clientBodyLimitBytes) {
                 return ErrorPages.response(cfg, 413);
