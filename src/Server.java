@@ -228,6 +228,48 @@ public class Server {
         }
     }
 
+    private void enforceTimeouts() {
+        long now = System.currentTimeMillis();
+        List<SocketChannel> toClose = new ArrayList<>();
+
+        for (var entry : contexts.entrySet()) {
+            SocketChannel ch = entry.getKey();
+            ConnectionContext ctx = entry.getValue();
+            long idle = now - ctx.lastActivityMs;
+
+            if (idle > IDLE_TIMEOUT_MS) {
+                toClose.add(ch);
+                continue;
+            }
+
+            // Parser stage timeouts
+            long stageAge = now - ctx.parser.stageStartMs;
+            switch (ctx.parser.stage) {
+                case HEADERS -> {
+                    if (stageAge > HEADER_TIMEOUT_MS) toClose.add(ch);
+                }
+                case BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_TRAILERS -> {
+                    if (stageAge > BODY_TIMEOUT_MS) toClose.add(ch);
+                }
+                default -> {}
+            }
+        }
+
+        for (SocketChannel ch : toClose) closeConnection(ch);
+
+        // Session cleanup tick
+        router.cleanupSessions(now);
+    }
+
+    private void closeConnection(SocketChannel ch) {
+        ConnectionContext ctx = contexts.remove(ch);
+        if (ctx != null) ctx.clearWriteQueue();
+        closeQuietly(ch);
+    }
+
+    private static void closeQuietly(Channel ch) {
+        try { ch.close(); } catch (Exception ignored) {}
+    }
 
     static final class ConnectionContext {
         final SocketChannel ch;
