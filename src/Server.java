@@ -34,5 +34,69 @@ public class Server {
         return metrics.snapshot(contexts.size(), pendingTotal);
     }
 
+    public void run() throws IOException {
+        selector = Selector.open();
+
+        // Bind multiple ports
+        for (int port : cfg.ports) {
+            ServerSocketChannel ssc = ServerSocketChannel.open();
+            ssc.configureBlocking(false);
+            ssc.bind(new InetSocketAddress(cfg.host, port));
+            ssc.register(selector, SelectionKey.OP_ACCEPT);
+            System.out.println("Listening on " + cfg.host + ":" + port);
+        }
+
+        // Main event loop: never crash
+        while (true) {
+            try {
+                selector.select(250); // short tick to handle timeouts
+
+                Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+                while (it.hasNext()) {
+                    SelectionKey key = it.next();
+                    it.remove();
+
+                    try {
+                        if (!key.isValid()) continue;
+
+                        int ops = key.readyOps(); // snapshot ops; safe against mid-loop cancellation
+
+                        if ((ops & SelectionKey.OP_ACCEPT) != 0) onAccept(key);
+                        if ((ops & SelectionKey.OP_READ)   != 0) onRead(key);
+                        if ((ops & SelectionKey.OP_WRITE)  != 0) onWrite(key);
+
+                    } catch (CancelledKeyException ignored) {
+                        // key cancelled while processing; ignore safely
+                    } catch (Exception e) {
+                        System.err.println("Key error: " + e.getMessage());
+                        e.printStackTrace();
+                        try { key.channel().close(); } catch (Exception ignored2) {}
+                    }
+                }
+
+                enforceTimeouts();
+
+            } catch (Exception e) {
+                // Catch-all: must never crash
+                System.err.println("Loop error: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void onAccept(SelectionKey key) throws IOException {
+        ServerSocketChannel ssc = (ServerSocketChannel) key.channel();
+        SocketChannel ch = ssc.accept();
+        if (ch == null) return;
+
+        ch.configureBlocking(false);
+        ch.socket().setTcpNoDelay(true);
+
+        ConnectionContext ctx = new ConnectionContext(ch);
+        contexts.put(ch, ctx);
+
+        ch.register(selector, SelectionKey.OP_READ);
+    }
+
 
 }
