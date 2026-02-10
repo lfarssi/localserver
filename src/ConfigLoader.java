@@ -1,5 +1,5 @@
-import java.nio.file.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.util.*;
 
 public class ConfigLoader {
