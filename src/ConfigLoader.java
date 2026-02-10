@@ -1,5 +1,5 @@
-import java.nio.file.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.util.*;
 
 public class ConfigLoader {
@@ -100,7 +100,72 @@ public class ConfigLoader {
         return cfg;
     }
 
- 
+    private static void validate(Config cfg) {
+        if (cfg.host == null || cfg.host.isBlank())
+            throw new IllegalArgumentException("host missing");
+
+        if (cfg.clientBodyLimitBytes <= 0)
+            throw new IllegalArgumentException("clientBodyLimitBytes must be > 0");
+
+        // Duplicate ports check (audit likes this)
+        Set<Integer> seen = new HashSet<>();
+        for (int p : cfg.ports) {
+            if (p <= 0 || p > 65535)
+                throw new IllegalArgumentException("invalid port: " + p);
+            if (!seen.add(p))
+                throw new IllegalArgumentException("duplicate port in config: " + p);
+        }
+
+        // Default server port must be one of the ports (or it makes no sense)
+        if (!cfg.ports.contains(cfg.defaultServerPort))
+            throw new IllegalArgumentException("defaultServerPort must be included in ports");
+
+        for (Route r : cfg.routes) {
+            if (r.pathPrefix == null || !r.pathPrefix.startsWith("/"))
+                throw new IllegalArgumentException("route.pathPrefix must start with /");
+
+            if (r.root == null || r.root.isBlank())
+                throw new IllegalArgumentException("route.root missing for " + r.pathPrefix);
+
+            // Normalize pathPrefix a bit (avoid "/cgi/" vs "/cgi" confusion)
+            if (r.pathPrefix.length() > 1 && r.pathPrefix.endsWith("/"))
+                r.pathPrefix = r.pathPrefix.substring(0, r.pathPrefix.length() - 1);
+
+            // Redirect validation
+            if (r.redirectTo != null && r.redirectTo.isBlank())
+                throw new IllegalArgumentException("redirectTo empty for " + r.pathPrefix);
+
+            // CGI validation
+            if (r.cgiExt != null) {
+                if (!r.cgiExt.startsWith("."))
+                    throw new IllegalArgumentException("cgiExt must start with '.' for " + r.pathPrefix);
+
+                if (r.cgiInterpreter == null || r.cgiInterpreter.isBlank())
+                    throw new IllegalArgumentException("cgiInterpreter missing for " + r.pathPrefix);
+
+                if (r.cgiTimeoutMs <= 0)
+                    throw new IllegalArgumentException("cgiTimeoutMs must be > 0 for " + r.pathPrefix);
+
+                if (r.cgiMaxOutputBytes <= 0)
+                    throw new IllegalArgumentException("cgiMaxOutputBytes must be > 0 for " + r.pathPrefix);
+            }
+        }
+    }
+
+    private static String str(Map<String, Object> o, String k, String def) {
+        Object v = o.get(k);
+        return (v == null) ? def : String.valueOf(v);
+    }
+
+    private static int num(Map<String, Object> o, String k, int def) {
+        Object v = o.get(k);
+        if (v == null) return def;
+        if (v instanceof Number) return ((Number) v).intValue();
+        // allow numeric strings just in case
+        try { return Integer.parseInt(String.valueOf(v).trim()); } catch (Exception e) { return def; }
+    }
+
+    private static boolean bool(Map<String, Object> o, String k, boolean def) {
         Object v = o.get(k);
         return (v instanceof Boolean) ? (Boolean) v : def;
     }
