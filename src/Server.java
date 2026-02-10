@@ -98,5 +98,180 @@ public class Server {
         ch.register(selector, SelectionKey.OP_READ);
     }
 
+    private void onRead(SelectionKey key) {
+        SocketChannel ch = (SocketChannel) key.channel();
+        ConnectionContext ctx = contexts.get(ch);
+        if (ctx == null) {
+            closeQuietly(ch);
+            return;
+        }
 
+        ctx.lastActivityMs = System.currentTimeMillis();
+
+        try {
+            int n = ch.read(ctx.readBuffer);
+            if (n == -1) {
+                closeConnection(ch);
+                return;
+            }
+            if (n == 0) return;
+
+            ctx.readBuffer.flip();
+
+            // Parse incrementally: may yield 0..N requests (pipelining)
+            while (true) {
+                HttpParser.ParseResult pr = ctx.parser.parse(ctx.readBuffer, cfg.clientBodyLimitBytes);
+                if (pr.status == HttpParser.Status.NEED_MORE) break;
+
+                if (pr.status == HttpParser.Status.ERROR) {
+                    int code = (pr.errorCode == 0) ? 400 : pr.errorCode;
+                    Response resp = ErrorPages.response(cfg, code);
+
+                    // Metrics: count as a response too (auditors like this)
+                    metrics.onRequest();
+                    metrics.onResponseStatus(resp.status);
+
+                    if (!ctx.enqueue(resp.toByteBuffers())) {
+                        closeConnection(ch);
+                        return;
+                    }
+
+                    if (key.isValid()) key.interestOps(SelectionKey.OP_WRITE);
+                    ctx.closeAfterWrite = true;
+                    break;
+                }
+
+                HttpModels.Request req = pr.request;
+
+                // Metrics: request received
+                metrics.onRequest();
+
+                // Attach useful connection attrs for CGI env parity
+                try {
+                    InetSocketAddress local = (InetSocketAddress) ch.getLocalAddress();
+                    InetSocketAddress remote = (InetSocketAddress) ch.getRemoteAddress();
+                    req.attrs.put("serverPort", local.getPort());
+                    req.attrs.put("remoteAddr", remote.getAddress().getHostAddress());
+                    req.attrs.put("remotePort", remote.getPort());
+                } catch (Exception ignored) {}
+
+                Response resp;
+                try {
+                    resp = router.handle(req);
+                } catch (Exception e) {
+                    System.err.println("Handler error: " + e.getMessage());
+                    e.printStackTrace();
+                    resp = ErrorPages.response(cfg, 500);
+                }
+
+                // Metrics: response status
+                metrics.onResponseStatus(resp.status);
+
+                if (!ctx.enqueue(resp.toByteBuffers())) {
+                    // client too slow; protect server
+                    closeConnection(ch);
+                    return;
+                }
+
+                // keep-alive logic (HTTP/1.1 default keep-alive unless Connection: close)
+                boolean close = "close".equalsIgnoreCase(req.headers.getOrDefault("connection", ""));
+                if (close || resp.closeAfterWrite) ctx.closeAfterWrite = true;
+
+                if (key.isValid()) key.interestOps(SelectionKey.OP_WRITE);
+
+                if (ctx.readBuffer.remaining() == 0) break;
+            }
+
+            ctx.readBuffer.compact();
+
+        } catch (IOException e) {
+            closeConnection(ch);
+        }
+    }
+
+    private void onWrite(SelectionKey key) {
+        SocketChannel ch = (SocketChannel) key.channel();
+        ConnectionContext ctx = contexts.get(ch);
+        if (ctx == null) {
+            closeQuietly(ch);
+            return;
+        }
+
+        ctx.lastActivityMs = System.currentTimeMillis();
+
+        try {
+            while (!ctx.writeQueue.isEmpty()) {
+                ConnectionContext.OutBuf ob = ctx.writeQueue.peek();
+
+                int before = ob.buf.remaining();
+                ch.write(ob.buf);
+                int after = ob.buf.remaining();
+
+                // Metrics: bytes out
+                metrics.onBytesOut(before - after);
+
+                if (ob.buf.hasRemaining()) break; // socket backpressure
+
+                ctx.writeQueue.poll();
+                ctx.pendingWriteBytes -= ob.bytes;
+            }
+
+            if (ctx.writeQueue.isEmpty()) {
+                if (ctx.closeAfterWrite) {
+                    closeConnection(ch);
+                    return;
+                }
+                if (key.isValid()) key.interestOps(SelectionKey.OP_READ);
+            }
+        } catch (IOException e) {
+            closeConnection(ch);
+        }
+    }
+
+
+    static final class ConnectionContext {
+        final SocketChannel ch;
+        final ByteBuffer readBuffer = ByteBuffer.allocateDirect(64 * 1024);
+        final Deque<OutBuf> writeQueue = new ArrayDeque<>();
+        final HttpParser parser = new HttpParser();
+
+        long lastActivityMs = System.currentTimeMillis();
+        boolean closeAfterWrite = false;
+
+        int pendingWriteBytes = 0;
+
+        static final class OutBuf {
+            final ByteBuffer buf;
+            final int bytes;
+            OutBuf(ByteBuffer buf) {
+                this.buf = buf;
+                this.bytes = buf.remaining();
+            }
+        }
+
+        ConnectionContext(SocketChannel ch) {
+            this.ch = ch;
+        }
+
+        boolean enqueue(List<ByteBuffer> bufs) {
+            int add = 0;
+            for (ByteBuffer b : bufs) add += b.remaining();
+
+            if (pendingWriteBytes + add > MAX_PENDING_WRITE_BYTES) {
+                return false;
+            }
+
+            for (ByteBuffer b : bufs) {
+                OutBuf ob = new OutBuf(b);
+                writeQueue.add(ob);
+                pendingWriteBytes += ob.bytes;
+            }
+            return true;
+        }
+
+        void clearWriteQueue() {
+            writeQueue.clear();
+            pendingWriteBytes = 0;
+        }
+    }
 }
