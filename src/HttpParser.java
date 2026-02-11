@@ -1,3 +1,4 @@
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -5,12 +6,24 @@ import java.util.*;
 public class HttpParser {
 
     public enum Status { OK, NEED_MORE, ERROR }
-    public enum Stage { START, HEADERS, BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_TRAILERS }
+    public enum Stage { START, HEADERS, BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_CRLF, CHUNK_TRAILERS }
+    public static final String ATTR_IGNORE_BODY = "ignoreBody";
+    public static final String ATTR_IGNORE_BODY_LEN = "ignoreBodyLength";
+
+    public interface BodyConsumer {
+        void accept(byte[] buf, int off, int len) throws IOException;
+        void close() throws IOException;
+        default void abort() {}
+    }
+
+    public interface BodyConsumerFactory {
+        BodyConsumer create(HttpModels.Request req, long contentLength, boolean chunked) throws IOException;
+    }
 
     public static final class ParseResult {
         public final Status status;
         public final HttpModels.Request request;
-        public final int errorCode; // 0 if not error; else 400/411/413
+        public final int errorCode; // 0 if not error; else 400/411/413/500
 
         private ParseResult(Status status, HttpModels.Request request, int errorCode) {
             this.status = status;
@@ -27,7 +40,9 @@ public class HttpParser {
     public long stageStartMs = System.currentTimeMillis();
 
     private HttpModels.Request current;
-    private int contentLength = 0;
+    private long contentLength = 0;
+    private long bodyRead = 0;
+    private byte[] fixedBodyBuf = null;
 
     // chunked state
     private int chunkRemaining = 0;
@@ -35,15 +50,31 @@ public class HttpParser {
 
     // body accumulation (yes, still buffers; streaming comes later)
     private final ByteArrayOutput bodyAcc = new ByteArrayOutput(16 * 1024);
-    private int bodyLimit = 0;
+    private long bodyLimit = 0;
 
-    public ParseResult parse(ByteBuffer in, int bodyLimitBytes) {
+    private final BodyConsumerFactory bodyConsumerFactory;
+    private BodyConsumer bodyConsumer;
+    private final byte[] streamBuf = new byte[64 * 1024];
+
+    public HttpParser() {
+        this(null);
+    }
+
+    public HttpParser(BodyConsumerFactory bodyConsumerFactory) {
+        this.bodyConsumerFactory = bodyConsumerFactory;
+    }
+
+    public ParseResult parse(ByteBuffer in, long bodyLimitBytes) {
+
         try {
             this.bodyLimit = bodyLimitBytes;
 
             if (stage == Stage.START) {
                 current = new HttpModels.Request();
                 contentLength = 0;
+                bodyRead = 0;
+                fixedBodyBuf = null;
+                bodyConsumer = null;
                 chunkRemaining = 0;
                 chunked = false;
                 bodyAcc.reset();
@@ -62,13 +93,22 @@ public class HttpParser {
                 }
 
                 // Decide body mode
+                boolean ignoreBody = isBodyIgnorable(current.method);
                 String te = current.headers.getOrDefault("transfer-encoding", "");
+                if (ignoreBody && containsChunked(te)) {
+                    current.attrs.put(ATTR_IGNORE_BODY, Boolean.TRUE);
+                    HttpModels.Request done = current;
+                    resetToStart();
+                    return ParseResult.ok(done);
+                }
                 if (containsChunked(te)) {
                     chunked = true;
                     stage = Stage.CHUNK_SIZE;
                     stageStartMs = System.currentTimeMillis();
                     // HTTP/1.1: ignore Content-Length if chunked present
                     contentLength = 0;
+                    bodyRead = 0;
+                    bodyConsumer = maybeCreateBodyConsumer(current, -1, true);
                 } else {
                     chunked = false;
                     String cl = current.headers.get("content-length");
@@ -79,10 +119,17 @@ public class HttpParser {
                         return ParseResult.error(411);
                     }
 
-                    contentLength = (cl == null) ? 0 : parseIntSafe(cl, -1);
+                    contentLength = (cl == null) ? 0 : parseLongSafe(cl, -1);
                     if (contentLength < 0) {
                         resetToStart();
                         return ParseResult.error(400);
+                    }
+                    if (ignoreBody && contentLength > 0) {
+                        current.attrs.put(ATTR_IGNORE_BODY, Boolean.TRUE);
+                        current.attrs.put(ATTR_IGNORE_BODY_LEN, contentLength);
+                        HttpModels.Request done = current;
+                        resetToStart();
+                        return ParseResult.ok(done);
                     }
                     if (contentLength > bodyLimit) {
                         resetToStart();
@@ -93,6 +140,15 @@ public class HttpParser {
                         resetToStart();
                         return ParseResult.ok(done);
                     }
+                    bodyRead = 0;
+                    bodyConsumer = maybeCreateBodyConsumer(current, contentLength, false);
+                    if (bodyConsumer == null) {
+                        if (contentLength > Integer.MAX_VALUE) {
+                            resetToStart();
+                            return ParseResult.error(413);
+                        }
+                        fixedBodyBuf = new byte[(int) contentLength];
+                    }
                     stage = Stage.BODY;
                     stageStartMs = System.currentTimeMillis();
                 }
@@ -100,10 +156,25 @@ public class HttpParser {
 
             // -------- FIXED BODY (Content-Length) --------
             if (stage == Stage.BODY) {
-                if (in.remaining() < contentLength) return ParseResult.needMore();
-                byte[] body = new byte[contentLength];
-                in.get(body);
-                current.body = body;
+                long remaining = contentLength - bodyRead;
+                if (remaining > 0 && in.remaining() > 0) {
+                    int toRead = (int) Math.min((long) in.remaining(), remaining);
+                    if (bodyConsumer != null) {
+                        consumeToBodyConsumer(in, toRead);
+                    } else {
+                        in.get(fixedBodyBuf, (int) bodyRead, toRead);
+                    }
+                    bodyRead += toRead;
+                }
+                if (bodyRead < contentLength) return ParseResult.needMore();
+
+                if (bodyConsumer != null) {
+                    bodyConsumer.close();
+                    bodyConsumer = null;
+                    current.body = new byte[0];
+                } else {
+                    current.body = fixedBodyBuf;
+                }
 
                 HttpModels.Request done = current;
                 resetToStart();
@@ -127,15 +198,21 @@ public class HttpParser {
                         return ParseResult.error(400);
                     }
 
-                    int size;
+                    long size;
                     try {
-                        size = Integer.parseInt(hex, 16);
+                        size = Long.parseLong(hex, 16);
                     } catch (Exception e) {
                         resetToStart();
                         return ParseResult.error(400);
                     }
 
-                    chunkRemaining = size;
+                    if (size < 0 || size > Integer.MAX_VALUE) {
+
+                        resetToStart();
+                        return ParseResult.error(413);
+                    }
+
+                    chunkRemaining = (int) size;
 
                     if (chunkRemaining == 0) {
                         // Next: trailers terminated by blank line
@@ -150,27 +227,43 @@ public class HttpParser {
                 }
 
                 if (stage == Stage.CHUNK_DATA) {
-                    // Need chunkRemaining bytes + CRLF after data
-                    if (in.remaining() < chunkRemaining + 2) return ParseResult.needMore();
+                    if (chunkRemaining > 0) {
+                        if (in.remaining() == 0) return ParseResult.needMore();
+                        int toRead = Math.min(chunkRemaining, in.remaining());
+                        if (bodyRead + toRead > bodyLimit) {
+                            resetToStart();
 
-                    // Enforce body limit while accumulating
-                    if (bodyAcc.size() + chunkRemaining > bodyLimit) {
-                        resetToStart();
-                        return ParseResult.error(413);
+                            return ParseResult.error(413);
+                        }
+                        if (bodyConsumer != null) {
+                            consumeToBodyConsumer(in, toRead);
+                        } else {
+                            if ((long) bodyAcc.size() + toRead > Integer.MAX_VALUE) {
+                                resetToStart();
+
+                                return ParseResult.error(413);
+                            }
+                            byte[] data = new byte[toRead];
+                            in.get(data);
+                            bodyAcc.write(data);
+                        }
+                        bodyRead += toRead;
+                        chunkRemaining -= toRead;
+                        if (chunkRemaining > 0) return ParseResult.needMore();
                     }
+                    stage = Stage.CHUNK_CRLF;
+                    stageStartMs = System.currentTimeMillis();
+                    continue;
+                }
 
-                    byte[] data = new byte[chunkRemaining];
-                    in.get(data);
-                    bodyAcc.write(data);
-
+                if (stage == Stage.CHUNK_CRLF) {
+                    if (in.remaining() < 2) return ParseResult.needMore();
                     byte c1 = in.get();
                     byte c2 = in.get();
                     if (c1 != '\r' || c2 != '\n') {
                         resetToStart();
                         return ParseResult.error(400);
                     }
-
-                    // Next chunk size line
                     stage = Stage.CHUNK_SIZE;
                     stageStartMs = System.currentTimeMillis();
                     continue;
@@ -184,7 +277,13 @@ public class HttpParser {
 
                     if (line.isEmpty()) {
                         // Done: finalize request
-                        current.body = bodyAcc.toByteArray();
+                        if (bodyConsumer != null) {
+                            bodyConsumer.close();
+                            bodyConsumer = null;
+                            current.body = new byte[0];
+                        } else {
+                            current.body = bodyAcc.toByteArray();
+                        }
                         HttpModels.Request done = current;
                         resetToStart();
                         return ParseResult.ok(done);
@@ -200,6 +299,9 @@ public class HttpParser {
 
             return ParseResult.needMore();
 
+        } catch (IOException e) {
+            resetToStart();
+            return ParseResult.error(500);
         } catch (Exception e) {
             resetToStart();
             return ParseResult.error(400);
@@ -211,9 +313,34 @@ public class HttpParser {
         stageStartMs = System.currentTimeMillis();
         current = null;
         contentLength = 0;
+        bodyRead = 0;
+        fixedBodyBuf = null;
+        if (bodyConsumer != null) {
+            try {
+                bodyConsumer.abort();
+            } catch (Exception ignored) {
+            }
+        }
+        bodyConsumer = null;
         chunkRemaining = 0;
         chunked = false;
         bodyAcc.reset();
+    }
+
+    private BodyConsumer maybeCreateBodyConsumer(HttpModels.Request req, long contentLength, boolean chunked)
+            throws IOException {
+        if (bodyConsumerFactory == null) return null;
+        return bodyConsumerFactory.create(req, contentLength, chunked);
+    }
+
+    private void consumeToBodyConsumer(ByteBuffer in, int bytes) throws IOException {
+        int remaining = bytes;
+        while (remaining > 0) {
+            int n = Math.min(remaining, streamBuf.length);
+            in.get(streamBuf, 0, n);
+            bodyConsumer.accept(streamBuf, 0, n);
+            remaining -= n;
+        }
     }
 
     private static boolean containsChunked(String te) {
@@ -229,6 +356,11 @@ public class HttpParser {
     private static boolean isLengthRequired(String method) {
         if (method == null) return false;
         return "POST".equals(method) || "PUT".equals(method);
+    }
+
+    private static boolean isBodyIgnorable(String method) {
+        if (method == null) return false;
+        return "GET".equals(method) || "HEAD".equals(method);
     }
 
     private static boolean parseStartLineAndHeaders(String block, HttpModels.Request req) {
@@ -264,8 +396,8 @@ public class HttpParser {
         return true;
     }
 
-    private static int parseIntSafe(String s, int def) {
-        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
+    private static long parseLongSafe(String s, long def) {
+        try { return Long.parseLong(s.trim()); } catch (Exception e) { return def; }
     }
 
     // Reads until \r\n\r\n. Returns text excluding delimiter. Null if incomplete.

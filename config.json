@@ -2,7 +2,7 @@
   "host": "0.0.0.0",
   "ports": [8080, 8081],
   "defaultServerPort": 8080,
-  "clientBodyLimitBytes": 10485760,
+  "clientBodyLimitBytes": 10485760000000,
   "errorPagesDir": "error_pages",
   "routes": [
     {
@@ -15,7 +15,7 @@
     {
       "pathPrefix": "/upload",
       "root": "uploads",
-      "methods": ["POST"],
+      "methods": ["POST", "GET"],
       "upload": true
     },
     {
@@ -24,7 +24,7 @@
       "methods": ["GET", "POST"],
       "cgiExt": ".py",
       "cgiInterpreter": "python3",
-      "cgiTimeoutMs":3000
+      "cgiTimeoutMs":30000
     },
     {
       "pathPrefix": "/old",

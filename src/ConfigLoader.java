@@ -8,7 +8,7 @@ public class ConfigLoader {
         public String host;
         public List<Integer> ports = new ArrayList<>();
         public int defaultServerPort;
-        public int clientBodyLimitBytes;
+        public long clientBodyLimitBytes;
         public String errorPagesDir;
         public List<Route> routes = new ArrayList<>();
     }
@@ -43,7 +43,7 @@ public class ConfigLoader {
         Config cfg = new Config();
         cfg.host = str(o, "host", "0.0.0.0");
         cfg.errorPagesDir = str(o, "errorPagesDir", "error_pages");
-        cfg.clientBodyLimitBytes = num(o, "clientBodyLimitBytes", 1024 * 1024);
+        cfg.clientBodyLimitBytes = numLong(o, "clientBodyLimitBytes", 1024L * 1024L);
         cfg.defaultServerPort = num(o, "defaultServerPort", 8080);
 
         List<Object> ports = arr(o, "ports");
@@ -159,10 +159,30 @@ public class ConfigLoader {
 
     private static int num(Map<String, Object> o, String k, int def) {
         Object v = o.get(k);
-        if (v == null) return def;
-        if (v instanceof Number) return ((Number) v).intValue();
+        if (v == null)
+            return def;
+        if (v instanceof Number)
+            return ((Number) v).intValue();
         // allow numeric strings just in case
-        try { return Integer.parseInt(String.valueOf(v).trim()); } catch (Exception e) { return def; }
+        try {
+            return Integer.parseInt(String.valueOf(v).trim());
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private static long numLong(Map<String, Object> o, String k, long def) {
+        Object v = o.get(k);
+        if (v == null)
+            return def;
+        if (v instanceof Number)
+            return ((Number) v).longValue();
+        // allow numeric strings just in case
+        try {
+            return Long.parseLong(String.valueOf(v).trim());
+        } catch (Exception e) {
+            return def;
+        }
     }
 
     private static boolean bool(Map<String, Object> o, String k, boolean def) {

@@ -1,7 +1,14 @@
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.*;
 
 public class Server {
@@ -15,14 +22,18 @@ public class Server {
     private final Metrics metrics = Metrics.get();
 
     // Timeouts (tune later)
-    private static final long IDLE_TIMEOUT_MS = 15_000;   // connection idle
+    private static final long IDLE_TIMEOUT_MS = 15_000; // connection idle
     private static final long HEADER_TIMEOUT_MS = 10_000; // header not finished
-    private static final long BODY_TIMEOUT_MS = 20_000;   // body not finished
+    // Body uploads can be long; rely on idle timeout instead.
+    private static final long BODY_TIMEOUT_MS = 0; // 0 = disabled
 
-    // Backpressure: max queued bytes per connection (prevents slow clients OOM-ing you)
+    // Backpressure: max queued bytes per connection (prevents slow clients OOM-ing
+    // you)
     private static final int MAX_PENDING_WRITE_BYTES = 2 * 1024 * 1024; // 2MB
+    private static final SecureRandom RNG = new SecureRandom();
 
     public Server(ConfigLoader.Config cfg, Router router) {
+
         this.cfg = cfg;
         this.router = router;
     }
@@ -30,7 +41,8 @@ public class Server {
     /** Called by Router/Admin to display server stats */
     public Metrics.Snapshot metricsSnapshot() {
         int pendingTotal = 0;
-        for (ConnectionContext ctx : contexts.values()) pendingTotal += ctx.pendingWriteBytes;
+        for (ConnectionContext ctx : contexts.values())
+            pendingTotal += ctx.pendingWriteBytes;
         return metrics.snapshot(contexts.size(), pendingTotal);
     }
 
@@ -57,20 +69,27 @@ public class Server {
                     it.remove();
 
                     try {
-                        if (!key.isValid()) continue;
+                        if (!key.isValid())
+                            continue;
 
                         int ops = key.readyOps(); // snapshot ops; safe against mid-loop cancellation
 
-                        if ((ops & SelectionKey.OP_ACCEPT) != 0) onAccept(key);
-                        if ((ops & SelectionKey.OP_READ)   != 0) onRead(key);
-                        if ((ops & SelectionKey.OP_WRITE)  != 0) onWrite(key);
+                        if ((ops & SelectionKey.OP_ACCEPT) != 0)
+                            onAccept(key);
+                        if ((ops & SelectionKey.OP_READ) != 0)
+                            onRead(key);
+                        if ((ops & SelectionKey.OP_WRITE) != 0)
+                            onWrite(key);
 
                     } catch (CancelledKeyException ignored) {
                         // key cancelled while processing; ignore safely
                     } catch (Exception e) {
                         System.err.println("Key error: " + e.getMessage());
                         e.printStackTrace();
-                        try { key.channel().close(); } catch (Exception ignored2) {}
+                        try {
+                            key.channel().close();
+                        } catch (Exception ignored2) {
+                        }
                     }
                 }
 
@@ -87,12 +106,13 @@ public class Server {
     private void onAccept(SelectionKey key) throws IOException {
         ServerSocketChannel ssc = (ServerSocketChannel) key.channel();
         SocketChannel ch = ssc.accept();
-        if (ch == null) return;
+        if (ch == null)
+            return;
 
         ch.configureBlocking(false);
         ch.socket().setTcpNoDelay(true);
 
-        ConnectionContext ctx = new ConnectionContext(ch);
+        ConnectionContext ctx = new ConnectionContext(ch, this::createBodyConsumer);
         contexts.put(ch, ctx);
 
         ch.register(selector, SelectionKey.OP_READ);
@@ -114,14 +134,16 @@ public class Server {
                 closeConnection(ch);
                 return;
             }
-            if (n == 0) return;
+            if (n == 0)
+                return;
 
             ctx.readBuffer.flip();
 
             // Parse incrementally: may yield 0..N requests (pipelining)
             while (true) {
                 HttpParser.ParseResult pr = ctx.parser.parse(ctx.readBuffer, cfg.clientBodyLimitBytes);
-                if (pr.status == HttpParser.Status.NEED_MORE) break;
+                if (pr.status == HttpParser.Status.NEED_MORE)
+                    break;
 
                 if (pr.status == HttpParser.Status.ERROR) {
                     int code = (pr.errorCode == 0) ? 400 : pr.errorCode;
@@ -136,7 +158,8 @@ public class Server {
                         return;
                     }
 
-                    if (key.isValid()) key.interestOps(SelectionKey.OP_WRITE);
+                    if (key.isValid())
+                        key.interestOps(SelectionKey.OP_WRITE);
                     ctx.closeAfterWrite = true;
                     break;
                 }
@@ -153,7 +176,8 @@ public class Server {
                     req.attrs.put("serverPort", local.getPort());
                     req.attrs.put("remoteAddr", remote.getAddress().getHostAddress());
                     req.attrs.put("remotePort", remote.getPort());
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
 
                 Response resp;
                 try {
@@ -175,11 +199,21 @@ public class Server {
 
                 // keep-alive logic (HTTP/1.1 default keep-alive unless Connection: close)
                 boolean close = "close".equalsIgnoreCase(req.headers.getOrDefault("connection", ""));
-                if (close || resp.closeAfterWrite) ctx.closeAfterWrite = true;
+                if (close || resp.closeAfterWrite)
+                    ctx.closeAfterWrite = true;
 
-                if (key.isValid()) key.interestOps(SelectionKey.OP_WRITE);
+                // If we intentionally ignored a request body (e.g., GET with body), drop buffered
+                // bytes and close after response to avoid desync.
+                if (Boolean.TRUE.equals(req.attrs.get(HttpParser.ATTR_IGNORE_BODY))) {
+                    ctx.readBuffer.position(ctx.readBuffer.limit());
+                    ctx.closeAfterWrite = true;
+                }
 
-                if (ctx.readBuffer.remaining() == 0) break;
+                if (key.isValid())
+                    key.interestOps(SelectionKey.OP_WRITE);
+
+                if (ctx.readBuffer.remaining() == 0)
+                    break;
             }
 
             ctx.readBuffer.compact();
@@ -210,7 +244,8 @@ public class Server {
                 // Metrics: bytes out
                 metrics.onBytesOut(before - after);
 
-                if (ob.buf.hasRemaining()) break; // socket backpressure
+                if (ob.buf.hasRemaining())
+                    break; // socket backpressure
 
                 ctx.writeQueue.poll();
                 ctx.pendingWriteBytes -= ob.bytes;
@@ -221,10 +256,99 @@ public class Server {
                     closeConnection(ch);
                     return;
                 }
-                if (key.isValid()) key.interestOps(SelectionKey.OP_READ);
+                if (key.isValid())
+                    key.interestOps(SelectionKey.OP_READ);
             }
         } catch (IOException e) {
             closeConnection(ch);
+        }
+    }
+
+    private HttpParser.BodyConsumer createBodyConsumer(HttpModels.Request req, long contentLength, boolean chunked)
+            throws IOException {
+        ConfigLoader.Route route = matchRoute(req.path);
+        if (route == null || !route.upload) return null;
+        if (!"POST".equals(req.method)) return null;
+        if (!route.methods.isEmpty() && !route.methods.contains(req.method)) return null;
+
+        String ct = req.headers.getOrDefault("content-type", "");
+        if (ct.toLowerCase(Locale.ROOT).startsWith("multipart/form-data")) return null;
+
+        Path uploadRoot = Path.of(route.root).toAbsolutePath().normalize();
+        Files.createDirectories(uploadRoot);
+
+        Path finalPath = allocateUniqueRawPath(uploadRoot);
+        Path tmpPath = finalPath.resolveSibling(finalPath.getFileName().toString() + ".part");
+
+        req.attrs.put(UploadHandler.ATTR_BODY_FILE, finalPath);
+        if (contentLength >= 0) req.attrs.put(UploadHandler.ATTR_BODY_FILE_SIZE, contentLength);
+
+        return new FileBodyConsumer(tmpPath, finalPath);
+    }
+
+    private ConfigLoader.Route matchRoute(String path) {
+        ConfigLoader.Route route = null;
+        int best = -1;
+        for (ConfigLoader.Route r : cfg.routes) {
+            if (path.startsWith(r.pathPrefix) && r.pathPrefix.length() > best) {
+                route = r;
+                best = r.pathPrefix.length();
+            }
+        }
+        return route;
+    }
+
+    private static Path allocateUniqueRawPath(Path root) throws IOException {
+        for (int n = 0; n < 10_000; n++) {
+            String name = "upload_" + Instant.now().toEpochMilli() + "_" + (RNG.nextInt() & 0x7fffffff) + ".bin";
+            Path p = safeResolveFile(root, name);
+            if (!Files.exists(p)) return p;
+        }
+        throw new IOException("Could not allocate unique filename");
+    }
+
+    private static Path safeResolveFile(Path root, String filename) throws IOException {
+        Path p = root.resolve(filename).normalize();
+        if (!p.startsWith(root)) throw new IOException("Traversal blocked");
+        return p;
+    }
+
+    private static final class FileBodyConsumer implements HttpParser.BodyConsumer {
+        private final Path tmpPath;
+        private final Path finalPath;
+        private OutputStream out;
+        private boolean closed = false;
+
+        FileBodyConsumer(Path tmpPath, Path finalPath) throws IOException {
+            this.tmpPath = tmpPath;
+            this.finalPath = finalPath;
+            this.out = Files.newOutputStream(tmpPath, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        }
+
+        @Override
+        public void accept(byte[] buf, int off, int len) throws IOException {
+            out.write(buf, off, len);
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) return;
+            closed = true;
+            out.flush();
+            out.close();
+            try {
+                Files.move(tmpPath, finalPath, StandardCopyOption.ATOMIC_MOVE);
+            } catch (Exception e) {
+                Files.move(tmpPath, finalPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+
+        @Override
+        public void abort() {
+            if (closed) return;
+            closed = true;
+            try { out.close(); } catch (Exception ignored) {}
+            try { Files.deleteIfExists(tmpPath); } catch (Exception ignored) {}
         }
     }
 
@@ -246,16 +370,20 @@ public class Server {
             long stageAge = now - ctx.parser.stageStartMs;
             switch (ctx.parser.stage) {
                 case HEADERS -> {
-                    if (stageAge > HEADER_TIMEOUT_MS) toClose.add(ch);
+                    if (stageAge > HEADER_TIMEOUT_MS)
+                        toClose.add(ch);
                 }
-                case BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_TRAILERS -> {
-                    if (stageAge > BODY_TIMEOUT_MS) toClose.add(ch);
+                case BODY, CHUNK_SIZE, CHUNK_DATA, CHUNK_CRLF, CHUNK_TRAILERS -> {
+                    if (BODY_TIMEOUT_MS > 0 && stageAge > BODY_TIMEOUT_MS)
+                        toClose.add(ch);
                 }
-                default -> {}
+                default -> {
+                }
             }
         }
 
-        for (SocketChannel ch : toClose) closeConnection(ch);
+        for (SocketChannel ch : toClose)
+            closeConnection(ch);
 
         // Session cleanup tick
         router.cleanupSessions(now);
@@ -263,19 +391,23 @@ public class Server {
 
     private void closeConnection(SocketChannel ch) {
         ConnectionContext ctx = contexts.remove(ch);
-        if (ctx != null) ctx.clearWriteQueue();
+        if (ctx != null)
+            ctx.clearWriteQueue();
         closeQuietly(ch);
     }
 
     private static void closeQuietly(Channel ch) {
-        try { ch.close(); } catch (Exception ignored) {}
+        try {
+            ch.close();
+        } catch (Exception ignored) {
+        }
     }
 
     static final class ConnectionContext {
         final SocketChannel ch;
         final ByteBuffer readBuffer = ByteBuffer.allocateDirect(64 * 1024);
         final Deque<OutBuf> writeQueue = new ArrayDeque<>();
-        final HttpParser parser = new HttpParser();
+        final HttpParser parser;
 
         long lastActivityMs = System.currentTimeMillis();
         boolean closeAfterWrite = false;
@@ -285,19 +417,22 @@ public class Server {
         static final class OutBuf {
             final ByteBuffer buf;
             final int bytes;
+
             OutBuf(ByteBuffer buf) {
                 this.buf = buf;
                 this.bytes = buf.remaining();
             }
         }
 
-        ConnectionContext(SocketChannel ch) {
+        ConnectionContext(SocketChannel ch, HttpParser.BodyConsumerFactory bodyConsumerFactory) {
             this.ch = ch;
+            this.parser = new HttpParser(bodyConsumerFactory);
         }
 
         boolean enqueue(List<ByteBuffer> bufs) {
             int add = 0;
-            for (ByteBuffer b : bufs) add += b.remaining();
+            for (ByteBuffer b : bufs)
+                add += b.remaining();
 
             if (pendingWriteBytes + add > MAX_PENDING_WRITE_BYTES) {
                 return false;

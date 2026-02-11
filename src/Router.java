@@ -55,7 +55,7 @@ public class Router {
 
         // upload handler
         if (route.upload) {
-            if (!"POST".equals(req.method)) {
+            if (!("POST".equals(req.method) || "GET".equals(req.method))) {
                 resp = ErrorPages.response(cfg, 405);
                 return attachSessionCookie(resp, needsSetCookie, session);
             }
