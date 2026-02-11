@@ -1,3 +1,5 @@
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -7,6 +9,7 @@ public class Response {
     public String reason;
     public byte[] body = new byte[0];
     public boolean closeAfterWrite = false;
+    public boolean chunked = false;
 
     // HTTP allows repeated headers (Set-Cookie). A Map is wrong.
     private final List<Map.Entry<String, String>> headers = new ArrayList<>();
@@ -42,7 +45,18 @@ public class Response {
         byte[] b = (body == null) ? new byte[0] : body;
         String r = (reason == null || reason.isBlank()) ? "OK" : reason;
 
-        if (getHeader("Content-Length") == null) setHeader("Content-Length", String.valueOf(b.length));
+        String te = getHeader("Transfer-Encoding");
+        boolean teChunked = te != null && "chunked".equalsIgnoreCase(te.trim());
+
+        if (chunked) {
+            headers.removeIf(e -> e.getKey().equalsIgnoreCase("Content-Length"));
+            if (!teChunked) setHeader("Transfer-Encoding", "chunked");
+            b = chunkedEncode(b);
+        } else if (teChunked) {
+            headers.removeIf(e -> e.getKey().equalsIgnoreCase("Content-Length"));
+        } else {
+            if (getHeader("Content-Length") == null) setHeader("Content-Length", String.valueOf(b.length));
+        }
         if (getHeader("Connection") == null) setHeader("Connection", closeAfterWrite ? "close" : "keep-alive");
         if (getHeader("Server") == null) setHeader("Server", "LocalServer/1.0");
 
@@ -55,5 +69,30 @@ public class Response {
 
         byte[] head = sb.toString().getBytes(StandardCharsets.ISO_8859_1);
         return List.of(ByteBuffer.wrap(head), ByteBuffer.wrap(b));
+    }
+
+    private static byte[] chunkedEncode(byte[] b) {
+        if (b == null || b.length == 0) {
+            return "0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1);
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, b.length / 8));
+        int i = 0;
+        while (i < b.length) {
+            int n = Math.min(8192, b.length - i);
+            String hex = Integer.toHexString(n);
+            try {
+                out.write(hex.getBytes(StandardCharsets.ISO_8859_1));
+                out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                out.write(b, i, n);
+                out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            } catch (IOException e) {
+                break;
+            }
+            i += n;
+        }
+        try {
+            out.write("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        } catch (IOException ignored) {}
+        return out.toByteArray();
     }
 }

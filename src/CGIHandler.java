@@ -14,11 +14,19 @@ public class CGIHandler {
         try {
             Path root = Path.of(route.root).toAbsolutePath().normalize();
 
-            // URL -> script under root
-            String rel = req.path.substring(route.pathPrefix.length());
-            if (rel.isEmpty()) rel = "/";
-            if (rel.startsWith("/")) rel = rel.substring(1);
-            Path script = root.resolve(rel).normalize();
+            // URL -> script under root (allow extra path after script extension)
+            String after = req.path.substring(route.pathPrefix.length());
+            if (after.isEmpty()) after = "/";
+
+            int extIdx = (route.cgiExt == null) ? -1 : after.indexOf(route.cgiExt);
+            if (extIdx < 0) return ErrorPages.response(cfg, 404);
+
+            String scriptRel = after.substring(0, extIdx + route.cgiExt.length());
+            String extraPathInfo = after.substring(extIdx + route.cgiExt.length());
+            if (scriptRel.isEmpty()) return ErrorPages.response(cfg, 404);
+            if (!scriptRel.startsWith("/")) scriptRel = "/" + scriptRel;
+
+            Path script = root.resolve(scriptRel.substring(1)).normalize();
 
             if (!script.startsWith(root)) return ErrorPages.response(cfg, 403);
             if (!Files.exists(script) || Files.isDirectory(script)) return ErrorPages.response(cfg, 404);
@@ -26,12 +34,9 @@ public class CGIHandler {
                 return ErrorPages.response(cfg, 404);
             }
 
-            // Interpreter: keep it simple: python3 for .py
-            String interpreter = "python3";
-            if (route.cgiExt != null && !route.cgiExt.equals(".py")) {
-                return Response.text(500, "Internal Server Error", "text/plain",
-                        "No interpreter configured for CGI ext: " + route.cgiExt + "\n");
-            }
+            String interpreter = (route.cgiInterpreter == null || route.cgiInterpreter.isBlank())
+                    ? "python3"
+                    : route.cgiInterpreter;
 
             ProcessBuilder pb = new ProcessBuilder(interpreter, script.toString());
             Map<String, String> env = pb.environment();
@@ -64,7 +69,10 @@ public class CGIHandler {
             // Your spec: PATH_INFO contains full paths
             env.put("PATH_INFO", script.toString());
             env.put("SCRIPT_FILENAME", script.toString());
-            env.put("SCRIPT_NAME", req.path);
+            String scriptName = "/".equals(route.pathPrefix) ? scriptRel : route.pathPrefix + scriptRel;
+            env.put("SCRIPT_NAME", scriptName);
+            env.put("PATH_TRANSLATED", script.toString());
+            env.put("EXTRA_PATH_INFO", extraPathInfo);
 
             // Content
             env.put("CONTENT_TYPE", req.headers.getOrDefault("content-type", ""));
@@ -93,8 +101,8 @@ public class CGIHandler {
             int timeoutMs = route.cgiTimeoutMs > 0 ? route.cgiTimeoutMs : DEFAULT_TIMEOUT_MS;
             int maxOut = route.cgiMaxOutputBytes > 0 ? route.cgiMaxOutputBytes : DEFAULT_MAX_STDOUT;
 
-            byte[] stdout = readCapped(p.getInputStream(), maxOut);
-            byte[] stderr = readCapped(p.getErrorStream(), DEFAULT_MAX_STDERR);
+            CappedRead stdout = readCapped(p.getInputStream(), maxOut);
+            CappedRead stderr = readCapped(p.getErrorStream(), DEFAULT_MAX_STDERR);
 
             boolean finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
             if (!finished) {
@@ -104,10 +112,16 @@ public class CGIHandler {
 
             if (p.exitValue() != 0) {
                 return Response.text(500, "Internal Server Error", "text/plain",
-                        "CGI failed (exit=" + p.exitValue() + ")\n" + snippet(stderr));
+                        "CGI failed (exit=" + p.exitValue() + ")\n" + snippet(stderr.data));
             }
 
-            return parseCgiStdout(stdout);
+            Response resp = parseCgiStdout(stdout.data);
+            if (stdout.truncated) {
+                resp.chunked = true;
+                resp.setHeader("Transfer-Encoding", "chunked");
+                resp.setHeader("X-CGI-Output-Truncated", "true");
+            }
+            return resp;
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -129,7 +143,7 @@ public class CGIHandler {
 
         if (sep < 0) {
             resp.body = stdout;
-            resp.setHeader("Content-Type", "application/octet-stream");
+            resp.setHeader("Content-Type", "text/plain; charset=utf-8");
             return resp;
         }
 
@@ -171,25 +185,49 @@ public class CGIHandler {
             resp.reason = "Found";
         }
 
+        // If CGI didn't provide length or transfer-encoding, use chunked
+        if (resp.getHeader("Content-Length") == null && resp.getHeader("Transfer-Encoding") == null) {
+            resp.chunked = true;
+            resp.setHeader("Transfer-Encoding", "chunked");
+        }
+
         if (resp.getHeader("Content-Type") == null) {
-            resp.setHeader("Content-Type", "application/octet-stream");
+            resp.setHeader("Content-Type", "text/plain; charset=utf-8");
         }
 
         return resp;
     }
 
-    private static byte[] readCapped(InputStream is, int cap) throws IOException {
+    private static CappedRead readCapped(InputStream is, int cap) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.min(32_768, cap));
         byte[] buf = new byte[8192];
         int total = 0;
+        boolean truncated = false;
         while (true) {
             int n = is.read(buf);
             if (n == -1) break;
             total += n;
-            if (total > cap) throw new IOException("CGI output exceeded cap: " + cap);
-            bos.write(buf, 0, n);
+            if (!truncated) {
+                if (total <= cap) {
+                    bos.write(buf, 0, n);
+                } else {
+                    int keep = n - (total - cap);
+                    if (keep > 0) bos.write(buf, 0, keep);
+                    truncated = true;
+                }
+            }
+            // if truncated, discard remaining bytes but keep draining to avoid deadlock
         }
-        return bos.toByteArray();
+        return new CappedRead(bos.toByteArray(), truncated);
+    }
+
+    private static final class CappedRead {
+        final byte[] data;
+        final boolean truncated;
+        CappedRead(byte[] data, boolean truncated) {
+            this.data = data;
+            this.truncated = truncated;
+        }
     }
 
     private static String snippet(byte[] b) {

@@ -71,13 +71,16 @@ public class Router {
         }
 
         // CGI
-        if (route.cgiExt != null && req.path.endsWith(route.cgiExt)) {
-            // If you haven't added CGIHandler yet, keep your 501, but sessions still apply
-            // resp = Response.text(501, "Not Implemented", "text/plain",
-            // "CGI route matched but CGI handler not wired yet.\n");
+        if (route.cgiExt != null) {
+            int extIdx = req.path.indexOf(route.cgiExt, route.pathPrefix.length());
+            if (extIdx >= 0) {
+                // If you haven't added CGIHandler yet, keep your 501, but sessions still apply
+                // resp = Response.text(501, "Not Implemented", "text/plain",
+                // "CGI route matched but CGI handler not wired yet.\n");
 
-            resp = CGIHandler.handle(cfg, route, req); // <-- requires the CGIHandler class I gave you
-            return attachSessionCookie(resp, needsSetCookie, session);
+                resp = CGIHandler.handle(cfg, route, req); // <-- requires the CGIHandler class I gave you
+                return attachSessionCookie(resp, needsSetCookie, session);
+            }
         }
         if ("GET".equals(req.method) && "/metrics".equals(req.path)) {
             return AdminView.metricsJson(ServerRef.get().metricsSnapshot());
